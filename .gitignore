@@ -1,0 +1,31 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.sln.docstates
+
+# Build Artifacts
+bin/
+obj/
+/agent/bin/
+/agent/obj/
+
+# Node.js
+node_modules/
+npm-debug.log
+
+# Firebase
+.firebase/
+firebase-debug.log
+
+# Agent Specific (Sensitive)
+device_id.txt
+keylogs.dat
+*.log
+install_error.log
+debug_agent.log
+activity.log
+
+# OS
+Thumbs.db
+.DS_Store

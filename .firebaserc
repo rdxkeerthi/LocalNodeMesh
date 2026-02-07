@@ -1,0 +1,7 @@
+{
+  "projects": {
+    "default": "windows-agent-10"
+  },
+  "targets": {},
+  "etags": {}
+}

