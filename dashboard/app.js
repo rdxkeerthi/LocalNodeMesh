@@ -322,7 +322,68 @@ async function sendCommand(type, msg) {
     alert(msg);
 }
 
-// Downloads Listener
+// Chunked Streaming Download
+window.downloadFirebaseFile = async (deviceId, reqId, filename) => {
+    try {
+        // First, get metadata
+        const metaSnapshot = await get(ref(db, `file_stream/${deviceId}/${reqId}/meta`));
+        const meta = metaSnapshot.val();
+
+        if (!meta) {
+            alert('File stream not found or expired.');
+            return;
+        }
+
+        const totalChunks = meta.totalChunks;
+        const chunks = [];
+
+        // Listen for all chunks
+        const chunksRef = ref(db, `file_stream/${deviceId}/${reqId}/chunks`);
+        const unsubscribe = onValue(chunksRef, async (snapshot) => {
+            const chunkData = snapshot.val();
+            if (!chunkData) return;
+
+            // Collect all chunks
+            for (let i = 0; i < totalChunks; i++) {
+                if (chunkData[i]) {
+                    chunks[i] = chunkData[i].data;
+                }
+            }
+
+            // Check if all chunks received
+            const received = chunks.filter(c => c).length;
+            if (received === totalChunks) {
+                unsubscribe();
+
+                // Assemble file
+                let fullBase64 = chunks.join('');
+                const binaryString = atob(fullBase64);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+
+                // Download
+                const blob = new Blob([bytes], { type: 'application/octet-stream' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+
+                // Delete stream data from Firebase to save storage
+                await remove(ref(db, `file_stream/${deviceId}/${reqId}`));
+            }
+        });
+    } catch (error) {
+        console.error('Download error:', error);
+        alert('Download failed: ' + error.message);
+    }
+};
+
 function loadDownloads(deviceId) {
     const el = document.getElementById('downloads-list');
     onValue(ref(db, `responses/${deviceId}`), (snap) => {
@@ -348,8 +409,19 @@ function loadDownloads(deviceId) {
                 action = `<span style="color:#f1c40f"><i class="fas fa-spinner fa-spin"></i> Uploading...</span>`;
             } else if (item.status === 'processing') {
                 action = `<span style="color:#9b59b6"><i class="fas fa-cog fa-spin"></i> Processing...</span>`;
-            } else if (item.status === 'success' || (item.url && !item.status)) { // Fallback for old items
-                // Use File.io or Base64 data if we used that (we reverted to File.io so url is link)
+            } else if (item.status === 'success') {
+                // Check if Firebase type (Base64)
+                if (item.type === 'firebase') {
+                    // Create download button that fetches Base64 data
+                    const btnId = `download-${item.timestamp}`;
+                    action = `<button onclick="downloadFirebaseFile('${deviceId}', '${Object.keys(data).find(k => data[k] === item)}', '${item.filename}')" class="action-btn" id="${btnId}"><i class="fas fa-download"></i> Download</button>`;
+                } else if (item.url) {
+                    // Legacy external URL (file.io)
+                    action = `<a href="${item.url}" target="_blank" class="action-btn"><i class="fas fa-download"></i> Open</a>`;
+                } else {
+                    action = `<span style="opacity:0.5">Ready</span>`;
+                }
+            } else if (item.url && !item.status) { // Fallback for old items
                 action = `<a href="${item.url}" target="_blank" class="action-btn"><i class="fas fa-download"></i> Open</a>`;
             } else if (item.status === 'failed' || item.error) {
                 const errMsg = item.message || item.error || 'Failed';
