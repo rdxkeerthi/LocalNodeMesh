@@ -69,7 +69,7 @@ function buildTree(files: FileNode[]): TreeNode {
         // Normalize path separators
         const normalizedPath = file.path.replace(/\\/g, '/');
         const parts = normalizedPath.split('/');
-        const fileName = parts.pop()!;
+        parts.pop(); // Remove filename, keep only directory parts
 
         let current = root;
         let pathSoFar = '';
